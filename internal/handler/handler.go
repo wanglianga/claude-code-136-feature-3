@@ -331,6 +331,68 @@ func Register(app *fiber.App, svc *service.Service) {
 		list, err := svc.ListGateLogs(ctx(), "", c.QueryInt("limit", 100))
 		return respond(c, list, err)
 	})
+
+	// ---- 闸机离线日志合并 / 权益回补 / 现场复核 ----
+	api.Post("/offline/batches", func(c *fiber.Ctx) error {
+		var in service.OfflineBatchInput
+		if err := c.BodyParser(&in); err != nil {
+			return fail(ErrBadRequest)
+		}
+		if in.Operator == "" {
+			in.Operator = operator(c, "")
+		}
+		b, err := svc.MergeOfflineLogs(ctx(), in)
+		return respond(c, b, err)
+	})
+	api.Get("/offline/batches", func(c *fiber.Ctx) error {
+		list, err := svc.ListOfflineBatches(ctx(), c.Query("device_id"), c.QueryInt("limit", 50))
+		return respond(c, list, err)
+	})
+	api.Get("/offline/batches/:id", func(c *fiber.Ctx) error {
+		b, err := svc.GetOfflineBatch(ctx(), c.Params("id"))
+		return respond(c, b, err)
+	})
+	api.Get("/offline/reviews", func(c *fiber.Ctx) error {
+		list, err := svc.ListReviewTasks(ctx(), c.Query("status"), c.QueryInt("limit", 100))
+		return respond(c, list, err)
+	})
+	api.Get("/offline/reviews/:id", func(c *fiber.Ctx) error {
+		rv, err := svc.GetReviewTask(ctx(), c.Params("id"))
+		return respond(c, rv, err)
+	})
+	api.Post("/offline/reviews/:id/resolve", func(c *fiber.Ctx) error {
+		var in service.ReviewResolveInput
+		if err := c.BodyParser(&in); err != nil {
+			return fail(ErrBadRequest)
+		}
+		if in.Operator == "" {
+			in.Operator = operator(c, "")
+		}
+		rv, err := svc.ResolveReviewTask(ctx(), c.Params("id"), in)
+		return respond(c, rv, err)
+	})
+	api.Get("/offline/refunds", func(c *fiber.Ctx) error {
+		list, err := svc.ListRefunds(ctx(), c.Query("pass_id"), c.QueryInt("limit", 100))
+		return respond(c, list, err)
+	})
+	api.Get("/offline/refunds/:id", func(c *fiber.Ctx) error {
+		r, err := svc.GetRefund(ctx(), c.Params("id"))
+		return respond(c, r, err)
+	})
+	api.Get("/notifications", func(c *fiber.Ctx) error {
+		list, err := svc.ListNotifications(ctx(), c.Query("pass_id"), c.Query("type"), c.Query("status"), c.QueryInt("limit", 100))
+		return respond(c, list, err)
+	})
+
+	// ---- 设备离线可靠性（运营维护计划 / 高峰入口调度） ----
+	admin.Get("/device-reliability", func(c *fiber.Ctx) error {
+		list, err := svc.DeviceReliability(ctx())
+		return respond(c, list, err)
+	})
+	admin.Get("/offline-incidents", func(c *fiber.Ctx) error {
+		list, err := svc.ListIncidents(ctx(), c.Query("device_id"), c.QueryInt("limit", 100))
+		return respond(c, list, err)
+	})
 }
 
 // ErrBadRequest 请求体错误

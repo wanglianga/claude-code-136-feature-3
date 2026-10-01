@@ -131,6 +131,8 @@ func (s *Service) Verify(ctx context.Context, req VerifyRequest) (*VerifyResult,
 	}
 	v.GateID = dev.GateID
 	if !req.OfflineSync && time.Since(dev.LastHeartbeat) > DeviceOfflineAfter {
+		// 登记（或复用）设备离线事件：合并离线日志时关闭，沉淀设备可靠性统计
+		s.EnsureOpenIncident(ctx, dev, time.Now())
 		return s.finish(ctx, v, nil, model.DecisionManual, model.ReasonDeviceOffline,
 			fmt.Sprintf("闸机 %s 心跳超时（>%s），转人工核验", dev.ID, DeviceOfflineAfter)), nil
 	}
@@ -222,6 +224,9 @@ func (s *Service) Verify(ctx context.Context, req VerifyRequest) (*VerifyResult,
 	}
 	req.Companions = companions
 	v.Companions = companions
+	if principal != nil {
+		v.PrincipalIDCard = principal.IDCard
+	}
 
 	// 7) 证件有效期（主入园人）
 	if principal != nil && principal.IDCardExpiry != "" && principal.IDCardExpiry < date {

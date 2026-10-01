@@ -72,11 +72,17 @@ def local_date():
     return datetime.datetime.now().astimezone().strftime("%Y-%m-%d")
 
 
+# 正常业务流统一使用动态计算的「最近工作日」（>= 今天、非节假日、周一至周五），
+# 使测试与运行当天是否节假日解耦，且保证在新购卡（valid_from=今天）的有效期内；
+# 节假日专项断言显式使用 "2026-10-01"（种子配置的国庆节假日）。A 段取到节假日后会覆盖该值。
+WORKDAY = None
+
+
 def local_ts(hour=10, minute=30, date=None):
     now = datetime.datetime.now().astimezone()
     tz = now.strftime("%z")
     tz = tz[:3] + ":" + tz[3:]
-    d = date or now.strftime("%Y-%m-%d")
+    d = date or WORKDAY
     return f"{d}T{hour:02d}:{minute:02d}:00{tz}"
 
 
@@ -144,7 +150,14 @@ check("种子设备 4 台且在线", st == 200 and len(r["data"]) == 4 and all(d
 st, r = req("GET", "/api/admin/sales-rules")
 check("售卖规则 3 类", st == 200 and len(r["data"]) == 3)
 st, r = req("GET", "/api/holidays")
-check("2026 节假日已配置", st == 200 and "2026-10-01" in r["data"])
+holidays = set(r.get("data", []))
+check("2026 节假日已配置", st == 200 and "2026-10-01" in holidays)
+
+# 选取 >= 今天的最近工作日（周一至周五且非节假日），作为全部正常流的入园日期
+_d = datetime.datetime.now().astimezone().date()
+while _d.weekday() >= 5 or _d.strftime("%Y-%m-%d") in holidays:
+    _d += datetime.timedelta(days=1)
+WORKDAY = _d.strftime("%Y-%m-%d")
 
 section("B. 购卡与售卖规则")
 p1 = buy_pass("single")
@@ -282,11 +295,10 @@ check("多地异常 SUSPECTED_LENDING/MULTI_LOCATION",
       r["data"]["decision"] == "SUSPECTED_LENDING" and r["data"]["reason"] == "MULTI_LOCATION", r)
 
 pcap = buy_pass("family")
-today = local_date()
-redis_cli("SET", f"cap:attr-garden:{today}", "3000")  # 百花园容量 3000
+redis_cli("SET", f"cap:attr-garden:{WORKDAY}", "3000")  # 百花园容量 3000（核验日为 WORKDAY）
 st, r = verify(pass_id=pcap["id"], attraction="attr-garden", ts=local_ts(10, 30))
 check("容量超限 CAPACITY_FULL", r["data"]["reason"] == "CAPACITY_FULL", r)
-redis_cli("DEL", f"cap:attr-garden:{today}")
+redis_cli("DEL", f"cap:attr-garden:{WORKDAY}")
 
 pquota = buy_pass("single")
 redis_cli("SET", f"pass:{pquota['id']}:remaining", "0")
@@ -314,14 +326,14 @@ check("闸机日志含 MANUAL_RELEASE", any(g["action"] == "MANUAL_RELEASE" for 
 section("F. 冻结/解冻与预约一致性")
 pr = buy_pass("single")
 st, r = req("POST", "/api/reservations", {"pass_id": pr["id"], "attraction": "attr-lake",
-                                          "date": local_date(), "slot": "10:00-12:00"})
+                                          "date": WORKDAY, "slot": "10:00-12:00"})
 rsv_id = r["data"]["id"]
 check("预约成功", st == 200 and r["data"]["status"] == "BOOKED", r)
 req("POST", f"/api/passes/{pr['id']}/freeze", {"reason": "涉嫌转借核查", "operator": "cs-wang"})
 st, r = req("GET", f"/api/passes/{pr['id']}/reservations")
 check("冻结不影响已预约未入园订单", r["data"][0]["status"] == "BOOKED", r)
 st, r = req("POST", "/api/reservations", {"pass_id": pr["id"], "attraction": "attr-lake",
-                                          "date": local_date(), "slot": "14:00-16:00"})
+                                          "date": WORKDAY, "slot": "14:00-16:00"})
 check("冻结期间不可新预约", st == 409, r)
 req("POST", f"/api/passes/{pr['id']}/unfreeze", {"operator": "cs-wang"})
 st, r = verify(pass_id=pr["id"], ts=local_ts(10, 30))
@@ -348,7 +360,7 @@ check("申诉重复处理被拒", st == 409, r)
 section("H. 退款与升级重算")
 pref = buy_pass("single")
 req("POST", "/api/reservations", {"pass_id": pref["id"], "attraction": "attr-lake",
-                                  "date": local_date(), "slot": "10:00-12:00"})
+                                  "date": WORKDAY, "slot": "10:00-12:00"})
 st, r = req("POST", f"/api/passes/{pref['id']}/refund", {"operator": "cs-wang"})
 check("退款：状态+退款金额", st == 200 and r["data"]["status"] == "refunded" and r["data"]["refund_amount"] > 0, r)
 check("退款后权益清零", remaining(pref["id"]) == 0)
@@ -431,8 +443,9 @@ req("POST", f"/api/passes/P000001/members/{zhangfu['id']}/face-exempt",
     {"exempt": True, "operator": "staff-chen"})
 
 section("K. 出园与容量")
+# 家庭卡节假日可用，入园/出园都按真实当天（出园接口按服务端日期释放容量），保证入/出园同日
 pk = buy_pass("family")
-st, r = verify(pass_id=pk["id"], attraction="attr-lake", ts=local_ts(11, 0))
+st, r = verify(pass_id=pk["id"], attraction="attr-lake", ts=local_ts(11, 0, local_date()))
 assert r["data"]["decision"] == "ALLOW", r
 st, r = req("GET", "/api/attractions/attr-lake/capacity")
 cap_after_enter = r["data"]["in_park"]
@@ -441,12 +454,12 @@ st, r = req("GET", "/api/attractions/attr-lake/capacity")
 check("出园释放在园容量", r["data"]["in_park"] == cap_after_enter - 1, r)
 
 section("L. 运营统计与日志")
-st, r = req("GET", "/api/admin/stats/overview")
+st, r = req("GET", "/api/admin/stats/overview?date="+WORKDAY)
 d = r["data"]
 check("总览：按卡类型统计", st == 200 and len(d["by_type"]) == 3 and d["entries_total"] > 0, d)
 check("总览：异常原因分布", "PHOTO_UNCLEAR" in d["anomaly_by_reason"] or len(d["anomaly_by_reason"]) > 0, d)
 check("总览：人工放行计数", d["manual_releases"] >= 2, d)
-st, r = req("GET", "/api/admin/stats/peaks")
+st, r = req("GET", "/api/admin/stats/peaks?date="+WORKDAY)
 check("峰值：24 小时分布", st == 200 and len(r["data"]["by_hour"]) == 24, r)
 st, r = req("GET", "/api/admin/gate-logs?limit=50")
 check("闸机日志查询", st == 200 and len(r["data"]) > 0, r)
@@ -454,6 +467,178 @@ st, r = req("GET", f"/api/passes/{pm['id']}/changes")
 check("变更日志留痕", st == 200 and any(c["action"] == "CREATE" for c in r["data"]), r)
 st, r = req("GET", "/api/appeals?status=APPROVED")
 check("申诉列表查询", st == 200 and len(r["data"]) >= 1, r)
+
+# ============================================================
+section("M. 闸机离线日志合并 / 重复扣次回补 / 现场复核")
+# 场景：东门断网，闸机离线放行年卡用户；恢复后上传离线日志批次
+req("POST", "/api/devices/dev-east-01/heartbeat")
+po = buy_pass("family")
+st, r = verify(pass_id=po["id"], req_id="M-ONLINE-1", attraction="attr-lake", ts=local_ts(10, 30))
+assert r["data"]["decision"] == "ALLOW", r
+online_vid = r["data"]["verification_id"]
+check("断网前在线入园扣 1（剩 399）", remaining(po["id"]) == 399, r)
+st, r = req("GET", f"/api/verifications/{online_vid}")
+check("在线核验记录主入园人证件", r["data"]["principal_id_card"] == po["holder_id_card"], r["data"])
+
+unbound_card = new_idcard().replace("ID", "UB")
+offline_batch = {
+    "device_id": "dev-east-01",
+    "client_token": "M-CLIENT-TOKEN-1",
+    "operator": "gate-sync",
+    "offline_from": local_ts(10, 31),
+    "offline_to": local_ts(11, 30),
+    "entries": [
+        # E1：同一游客 11:00 在同景点被离线闸机重复放行 → REVERSED 回补
+        {"local_seq": "M-E1", "request_id": "M-OFF-E1", "pass_id": po["id"], "attraction": "attr-lake",
+         "released_at": local_ts(11, 0), "headcount": 1},
+        # E2：同行人未绑定 → REVIEW
+        {"local_seq": "M-E2", "request_id": "M-OFF-E2", "pass_id": po["id"], "attraction": "attr-lake",
+         "released_at": local_ts(11, 10), "companions": [unbound_card], "headcount": 2},
+        # E3：无法定位年卡 → REVIEW
+        {"local_seq": "M-E3", "id_card": "999999199001010001", "name": "无法识别游客",
+         "attraction": "attr-lake", "released_at": local_ts(11, 20), "headcount": 1},
+        # E4：request_id 与断网前在线核验相同 → DUPLICATE_REQ
+        {"local_seq": "M-E4", "request_id": "M-ONLINE-1", "pass_id": po["id"], "attraction": "attr-lake",
+         "released_at": local_ts(11, 30), "headcount": 1},
+    ],
+}
+st, r = req("POST", "/api/offline/batches", offline_batch)
+check("上传离线批次 200", st == 200, r)
+b = r["data"]
+check("批次 CONFLICT（含待复核）", b["status"] == "CONFLICT", b)
+check("批次计数 total=4 merged=0 dup=1 reversed=1 review=2",
+      (b["total"], b["merged_count"], b["duplicate_count"], b["reversed_count"], b["review_count"]) == (4, 0, 1, 1, 2), b)
+check("回补人次合计=1", b["refund_quota_sum"] == 1, b)
+emap = {e["local_seq"]: e for e in b["entries"]}
+check("E1 REVERSED 并带回补单", emap["M-E1"]["status"] == "REVERSED" and emap["M-E1"]["refund_id"], emap["M-E1"])
+check("E2 未绑定同行人 REVIEW", emap["M-E2"]["status"] == "REVIEW" and emap["M-E2"]["review_id"], emap["M-E2"])
+check("E3 无法定位年卡 REVIEW", emap["M-E3"]["status"] == "REVIEW" and emap["M-E3"]["review_id"], emap["M-E3"])
+check("E4 同 request_id DUPLICATE_REQ", emap["M-E4"]["status"] == "DUPLICATE_REQ", emap["M-E4"])
+check("重复扣次已自动回补（仍剩 399）", remaining(po["id"]) == 399, f"rem={remaining(po['id'])}")
+
+# 回补单留痕
+st, r = req("GET", f"/api/offline/refunds?pass_id={po['id']}")
+rf = r["data"][0]
+check("回补单：额度 1 / 设备 / 首次入园关联",
+      rf["quota"] == 1 and rf["device_id"] == "dev-east-01" and rf["duplicate_of"] == online_vid
+      and rf["verification_id"] == emap["M-E1"]["verification_id"] and rf["status"] == "DONE", rf)
+st, r = req("GET", f"/api/offline/refunds/{rf['id']}")
+check("回补单可按 ID 查询", st == 200 and r["data"]["id"] == rf["id"], r)
+# 被回补的离线核验记录留痕
+st, r = req("GET", f"/api/verifications/{emap['M-E1']['verification_id']}")
+check("重复离线核验标记 reversed_by + DUPLICATE_ENTRY",
+      r["data"]["reversed_by"] == rf["id"] and r["data"]["reason"] == "DUPLICATE_ENTRY"
+      and r["data"]["offline_batch_id"] == b["id"] and r["data"]["offline_local_seq"] == "M-E1", r["data"])
+# 通知游客
+st, r = req("GET", f"/api/notifications?pass_id={po['id']}&type=QUOTA_REFUND")
+check("回补短信通知已发送", len(r["data"]) == 1 and r["data"][0]["status"] == "SENT"
+      and r["data"][0]["channel"] == "sms" and po["id"] in r["data"][0]["content"], r)
+st, r = req("GET", f"/api/passes/{po['id']}/changes")
+check("年卡变更日志含 OFFLINE_REFUND", any(c["action"] == "OFFLINE_REFUND" for c in r["data"]), r)
+st, r = req("GET", f"/api/passes/{po['id']}/gate-logs")
+check("闸机流水含离线放行 OFFLINE_ALLOW / OFFLINE_REVIEW",
+      any(g["action"] == "OFFLINE_ALLOW" for g in r["data"]) and any(g["action"] == "OFFLINE_REVIEW" for g in r["data"]), r)
+
+# 批次详情与列表
+st, r = req("GET", f"/api/offline/batches/{b['id']}")
+check("批次详情含 4 条明细", st == 200 and len(r["data"]["entries"]) == 4, r)
+st, r = req("GET", "/api/offline/batches?device_id=dev-east-01")
+check("按设备查批次列表", st == 200 and any(x["id"] == b["id"] for x in r["data"]), r)
+# 整包重传（闸机重试同一批）→ 返回同一批次，不重复合并
+st, r = req("POST", "/api/offline/batches", offline_batch)
+check("整包重传幂等（同一批次，计数不变）",
+      r["data"]["id"] == b["id"] and r["data"]["total"] == 4 and r["data"]["reversed_count"] == 1, r)
+
+# 现场复核：E2 补登记同行人并补扣
+rv_e2 = emap["M-E2"]["review_id"]
+st, r = req("GET", "/api/offline/reviews?status=PENDING")
+pending_ids = [x["id"] for x in r["data"]]
+check("待复核任务 2 条", rv_e2 in pending_ids and emap["M-E3"]["review_id"] in pending_ids, r)
+st, r = req("POST", f"/api/offline/reviews/{rv_e2}/resolve", {
+    "action": "REGISTER", "operator": "staff-chen", "note": "现场核实为家属，补登记并补扣",
+    "registrations": [{"name": "离线补登记家属", "id_card": unbound_card, "relation": "other"}]})
+check("E2 补登记：按放行人数补扣 2（剩 397）",
+      st == 200 and r["data"]["status"] == "RESOLVED" and r["data"]["charged_quota"] == 2
+      and remaining(po["id"]) == 397, r)
+st, r = req("GET", f"/api/passes/{po['id']}")
+check("补登记的同行人已入成员列表", any(m["id_card"] == unbound_card for m in r["data"]["members"]), r)
+# 现场复核：E3 标记异常放行，不补扣
+st, r = req("POST", f"/api/offline/reviews/{emap['M-E3']['review_id']}/resolve",
+            {"action": "ABNORMAL", "operator": "staff-chen", "note": "无法核实身份，标记异常放行留痕"})
+check("E3 标记异常放行（不补扣，仍剩 397）",
+      st == 200 and r["data"]["action"] == "ABNORMAL" and remaining(po["id"]) == 397, r)
+st, r = req("POST", f"/api/offline/reviews/{rv_e2}/resolve",
+            {"action": "ABNORMAL", "operator": "staff-chen", "note": "重复处置"})
+check("复核任务不可重复处理", st == 409, r)
+st, r = req("GET", "/api/offline/reviews?status=PENDING")
+check("待复核清零", len(r["data"]) == 0, r)
+
+# 正常离线放行（无重复）：MERGED 扣次；容量净额只 +1（重复那条回补）
+pm = buy_pass("family")
+st, cap_before = req("GET", "/api/attractions/attr-summit/capacity?date="+WORKDAY)
+cap_before = cap_before["data"]["in_park"]
+st, r = req("POST", "/api/offline/batches", {
+    "device_id": "dev-west-01", "client_token": "M-CLIENT-TOKEN-2",
+    "entries": [
+        {"local_seq": "M-W1", "pass_id": pm["id"], "attraction": "attr-summit",
+         "released_at": local_ts(11, 5), "headcount": 1},
+        {"local_seq": "M-W2", "pass_id": pm["id"], "attraction": "attr-summit",
+         "released_at": local_ts(11, 15), "headcount": 1},
+    ]})
+check("正常+重复批次：MERGED=1 REVERSED=1 状态 MERGED",
+      r["data"]["merged_count"] == 1 and r["data"]["reversed_count"] == 1 and r["data"]["status"] == "MERGED", r)
+check("无重复时正常入账扣 1（剩 399）", remaining(pm["id"]) == 399, f"rem={remaining(pm['id'])}")
+st, cap_after = req("GET", "/api/attractions/attr-summit/capacity?date="+WORKDAY)
+check("容量净额只增 1（重复放行已回补容量）", cap_after["data"]["in_park"] == cap_before + 1,
+      f"{cap_before} -> {cap_after['data']['in_park']}")
+
+# 复核 CHARGE：确认入园但补扣权益
+pc2 = buy_pass("family")
+charge_card = new_idcard().replace("ID", "UC")
+st, r = req("POST", "/api/offline/batches", {
+    "device_id": "dev-south-01", "client_token": "M-CLIENT-TOKEN-3",
+    "entries": [
+        {"local_seq": "M-S1", "pass_id": pc2["id"], "attraction": "attr-garden",
+         "released_at": local_ts(11, 8), "companions": [charge_card], "headcount": 2},
+    ]})
+rv_charge = r["data"]["entries"][0]["review_id"]
+check("未绑定同行人推复核", r["data"]["entries"][0]["status"] == "REVIEW", r)
+st, r = req("POST", f"/api/offline/reviews/{rv_charge}/resolve",
+            {"action": "CHARGE", "operator": "staff-chen", "note": "确认实际入园 2 人，补扣权益", "pass_id": pc2["id"]})
+check("CHARGE 补扣 2 人次（剩 398）",
+      st == 200 and r["data"]["charged_quota"] == 2 and remaining(pc2["id"]) == 398, r)
+
+# 边界：权益耗尽后重复离线放行——识别为重复但实扣 0，不超额回补、额度不为负
+pe = buy_pass("single")
+st, r = verify(pass_id=pe["id"], req_id="M-EDGE-ON", attraction="attr-lake", ts=local_ts(10, 30))
+assert r["data"]["decision"] == "ALLOW", r
+redis_cli("SET", f"pass:{pe['id']}:remaining", "0")
+st, r = req("POST", "/api/offline/batches", {
+    "device_id": "dev-east-01", "client_token": "M-CLIENT-TOKEN-4",
+    "entries": [
+        {"local_seq": "M-E0", "pass_id": pe["id"], "attraction": "attr-lake",
+         "released_at": local_ts(11, 2), "headcount": 1},
+    ]})
+ee = r["data"]["entries"][0]
+check("权益耗尽时重复放行识别 REVERSED 但不回补", ee["status"] == "REVERSED" and not ee.get("refund_id"), ee)
+check("额度不出现负数/超额回补", remaining(pe["id"]) == 0, f"rem={remaining(pe['id'])}")
+
+# 设备离线事件与可靠性统计
+st, r = req("GET", "/api/admin/offline-incidents?device_id=dev-east-01")
+incs = r["data"]
+inc_b = next((x for x in incs if x["batch_id"] == b["id"]), None)
+check("东门离线事件已关闭并关联批次",
+      inc_b is not None and inc_b["status"] == "CLOSED" and inc_b["offline_logs"] == 4
+      and inc_b["duration_sec"] >= 0, r)
+st, r = req("GET", "/api/admin/device-reliability")
+rels = {d["device_id"]: d for d in r["data"]}
+check("可靠性：东门离线次数/回补人次沉淀",
+      rels["dev-east-01"]["offline_count"] >= 1 and rels["dev-east-01"]["refund_quota"] >= 1
+      and len(rels["dev-east-01"]["recent_incidents"]) >= 1, r)
+check("可靠性：D 段离线闸机有未关闭事件",
+      rels["dev-offline-01"]["offline_count"] >= 1 and rels["dev-offline-01"]["open_incidents"] >= 1, r)
+counts = [d["offline_count"] for d in r["data"]]
+check("可靠性列表按离线次数倒序（最易离线在前）", counts == sorted(counts, reverse=True), counts)
 
 print(f"\n========================================")
 print(f"RESULT: PASS={PASS} FAIL={FAIL}")
