@@ -1,0 +1,9 @@
+.git
+*.md
+test/
+.claude/
+.codex/
+*.log
+passgate
+/tmp
+tmp/

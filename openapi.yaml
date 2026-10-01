@@ -1,0 +1,936 @@
+openapi: 3.0.3
+info:
+  title: passgate 景区年卡核验服务
+  version: "1.1.0"
+  description: >
+    景区年卡实名入园、同行权益、异常核验服务。本期扩展【闸机离线后的权益回补】：
+
+    1. 闸机离线时本地放行年卡用户，恢复后通过 POST /api/offline/batches 合并离线日志；
+    2. 按「同一游客 + 同一景点 + 同一日期」聚合入园事件，识别重复刷闸导致的重复扣次，
+       自动回补权益（remaining/used 权威计数器）并向游客发送短信通知；
+    3. 离线期间出现未绑定同行人入园时，生成现场复核单，现场可决定
+       补登记(REGISTER) / 扣权益(CHARGE) / 标记异常放行(ANOMALY)；
+    4. 合并结果累计闸机离线指标，运营可通过离线排行查看哪些闸机最容易离线。
+servers:
+  - url: http://127.0.0.1:8080
+    description: 本地开发
+tags:
+  - name: Passes
+    description: 年卡生命周期
+  - name: Verification
+    description: 入园核验 / 人工放行 / 出园
+  - name: Devices
+    description: 闸机设备与心跳
+  - name: Offline
+    description: 离线日志合并、权益回补、现场复核
+  - name: Notifications
+    description: 游客通知（短信/站内信）
+  - name: Reservations
+    description: 预约
+  - name: Appeals
+    description: 申诉
+  - name: Admin
+    description: 运营规则与统计
+  - name: Base
+    description: 基础数据
+paths:
+  /healthz:
+    get:
+      tags: [Base]
+      summary: 健康检查
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+
+  /api/passes:
+    post:
+      tags: [Passes]
+      summary: 购卡（实名+人脸+证件+成员，按售卖规则快照发卡）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, holder_name, holder_id_card, id_card_expiry, phone]
+              properties:
+                type: { type: string, enum: [single, family, parent_child] }
+                holder_name: { type: string }
+                holder_id_card: { type: string }
+                id_card_expiry: { type: string, example: "2032-01-01" }
+                phone: { type: string }
+                photo_url: { type: string }
+                members:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      name: { type: string }
+                      id_card: { type: string }
+                      id_card_expiry: { type: string }
+                      relation: { type: string, example: spouse }
+                      photo_url: { type: string }
+                      face_exempt: { type: boolean }
+      responses:
+        "200":
+          description: 购卡成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DataEnvelope"
+        "409": { $ref: "#/components/responses/Conflict" }
+    get:
+      tags: [Passes]
+      summary: 按手机号查卡
+      parameters:
+        - { name: phone, in: query, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+
+  /api/passes/{id}:
+    get:
+      tags: [Passes]
+      summary: 年卡详情（实时剩余额度、成员、二维码 token）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/passes/{id}/freeze:
+    post:
+      tags: [Passes]
+      summary: 冻结（不影响已预约未入园订单）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string }
+                operator: { type: string }
+      responses:
+        "200": { description: OK }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/passes/{id}/unfreeze:
+    post:
+      tags: [Passes]
+      summary: 解冻
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody: { content: { application/json: { schema: { type: object, properties: { operator: { type: string } } } } } }
+      responses:
+        "200": { description: OK }
+
+  /api/passes/{id}/refund:
+    post:
+      tags: [Passes]
+      summary: 退款（折算 80%，权益清零，未用预约取消）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody: { content: { application/json: { schema: { type: object, properties: { operator: { type: string } } } } } }
+      responses:
+        "200": { description: OK }
+
+  /api/passes/{id}/upgrade:
+    post:
+      tags: [Passes]
+      summary: 升级（补差价，有效期与额度按新卡重算）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to_type]
+              properties:
+                to_type: { type: string, enum: [single, family, parent_child] }
+                operator: { type: string }
+      responses:
+        "200": { description: OK }
+
+  /api/passes/{id}/phone:
+    post:
+      tags: [Passes]
+      summary: 换绑手机号（演示验证码固定 123456）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [old_phone, new_phone, code]
+              properties:
+                old_phone: { type: string }
+                new_phone: { type: string }
+                code: { type: string, example: "123456" }
+      responses:
+        "200": { description: OK }
+        "403": { description: 验证码错误 }
+
+  /api/passes/{id}/members:
+    post:
+      tags: [Passes]
+      summary: 添加同行成员（消耗更换次数）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                id_card: { type: string }
+                relation: { type: string }
+                operator: { type: string }
+      responses:
+        "200": { description: OK }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/passes/{id}/members/{mid}:
+    delete:
+      tags: [Passes]
+      summary: 移除同行成员
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: mid, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+
+  /api/passes/{id}/members/{mid}/photo:
+    post:
+      tags: [Passes]
+      summary: 更新成员人脸照片（版本+1）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: mid, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [photo_url]
+              properties:
+                photo_url: { type: string }
+                operator: { type: string }
+      responses:
+        "200": { description: OK }
+
+  /api/passes/{id}/members/{mid}/face-exempt:
+    post:
+      tags: [Passes]
+      summary: 设置/取消免刷脸标记
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: mid, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                exempt: { type: boolean }
+                operator: { type: string }
+      responses:
+        "200": { description: OK }
+
+  /api/passes/{id}/qr-refresh:
+    post:
+      tags: [Passes]
+      summary: 刷新二维码（旧码立即失效）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+
+  /api/passes/{id}/changes:
+    get:
+      tags: [Passes]
+      summary: 变更日志（含离线回补 OFFLINE_REFUND 等留痕）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+
+  /api/passes/{id}/verifications:
+    get:
+      tags: [Passes]
+      summary: 年卡核验历史
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+
+  /api/passes/{id}/reservations:
+    get:
+      tags: [Passes]
+      summary: 年卡预约列表
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+
+  /api/passes/{id}/gate-logs:
+    get:
+      tags: [Passes]
+      summary: 闸机流水
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+
+  /api/passes/{id}/offline-reviews:
+    get:
+      tags: [Offline]
+      summary: 年卡视角的离线复核单
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string, enum: [PENDING, REGISTERED, CHARGED, ANOMALY] } }
+      responses:
+        "200": { description: OK }
+
+  /api/verify:
+    post:
+      tags: [Verification]
+      summary: 闸机核验
+      description: |
+        返回 decision：ALLOW / MANUAL_REVIEW / QUOTA_INSUFFICIENT / SUSPECTED_LENDING，
+        失败或转人工带 reason 原因码。offline_sync=true 表示闸机离线补传。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VerifyRequest"
+      responses:
+        "200":
+          description: 核验结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/VerifyResult" }
+
+  /api/verifications/{id}:
+    get:
+      tags: [Verification]
+      summary: 核验详情（含人工处理链路）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/verifications/{id}/manual-review:
+    post:
+      tags: [Verification]
+      summary: 现场人工放行/拒绝（必须填操作人与说明）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action, operator, note]
+              properties:
+                action: { type: string, enum: [RELEASE, REJECT] }
+                operator: { type: string }
+                note: { type: string }
+      responses:
+        "200": { description: OK }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/exit:
+    post:
+      tags: [Verification]
+      summary: 出园，释放在园容量
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pass_id, attraction]
+              properties:
+                pass_id: { type: string }
+                attraction: { type: string }
+                count: { type: integer, default: 1 }
+                device_id: { type: string }
+                date: { type: string, description: "可选 YYYY-MM-DD，闸机补传出园时上报" }
+      responses:
+        "200": { description: OK }
+
+  /api/devices:
+    post:
+      tags: [Devices]
+      summary: 注册闸机
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, gate_id, attraction]
+              properties:
+                id: { type: string, example: dev-east-01 }
+                name: { type: string }
+                gate_id: { type: string }
+                attraction: { type: string }
+      responses:
+        "200": { description: OK }
+    get:
+      tags: [Devices]
+      summary: 设备列表（含在线状态，60s 无心跳判离线）
+      responses:
+        "200": { description: OK }
+
+  /api/devices/{id}/heartbeat:
+    post:
+      tags: [Devices]
+      summary: 设备心跳
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/offline/batches:
+    post:
+      tags: [Offline]
+      summary: 合并闸机离线日志（网络恢复后上报）
+      description: |
+        一台闸机恢复后，把离线期间本地放行的日志整批上报。服务端：
+        1) 按 request_id 幂等（已合并的日志跳过，整批重复上报返回 409）；
+        2) 按「年卡 + 景点 + 日期 + 主入园人证件」聚合分组；
+        3) 逐条按闸机本地放行人数扣减，组内超出实际入园人次的部分判为重复扣次，自动回补并短信通知；
+        4) 出现未绑定同行人则生成 PENDING 现场复核单；
+        5) 累计该闸机离线次数/时长/放行数/回补/异常等指标。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OfflineBatchInput"
+      responses:
+        "200":
+          description: 合并结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/OfflineBatch" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Conflict" }
+    get:
+      tags: [Offline]
+      summary: 离线批次列表
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, default: 50 } }
+      responses:
+        "200": { description: OK }
+
+  /api/offline/batches/{id}:
+    get:
+      tags: [Offline]
+      summary: 离线批次详情（含每个游客分组的对账结果）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/OfflineBatch" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/offline/reviews:
+    get:
+      tags: [Offline]
+      summary: 现场复核单列表
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [PENDING, REGISTERED, CHARGED, ANOMALY] } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/OfflineReview" }
+
+  /api/offline/reviews/{id}/resolve:
+    post:
+      tags: [Offline]
+      summary: 现场处置未绑定同行人入园
+      description: |
+        REGISTER 补登记（事后绑定为同行成员，受成员更换名额约束，本次不追扣）；
+        CHARGE 扣权益（确认入园，追扣 1 人次）；
+        ANOMALY 标记异常放行（不扣不登记，留痕待查）。处置后向游客发短信通知。
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action, operator, note]
+              properties:
+                action: { type: string, enum: [REGISTER, CHARGE, ANOMALY] }
+                name: { type: string, description: REGISTER 时补登记人员姓名 }
+                relation: { type: string, example: other }
+                operator: { type: string }
+                note: { type: string }
+      responses:
+        "200":
+          description: 处置结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: "#/components/schemas/OfflineReview" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/notifications:
+    get:
+      tags: [Notifications]
+      summary: 通知查询（可按年卡过滤）
+      parameters:
+        - { name: pass_id, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 50 } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/Notification" }
+
+  /api/reservations:
+    post:
+      tags: [Reservations]
+      summary: 创建预约（冻结卡不可新预约）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pass_id, attraction, date]
+              properties:
+                pass_id: { type: string }
+                attraction: { type: string }
+                date: { type: string, example: "2026-10-09" }
+                slot: { type: string }
+      responses:
+        "200": { description: OK }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/reservations/{id}/cancel:
+    post:
+      tags: [Reservations]
+      summary: 取消预约
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+
+  /api/appeals:
+    post:
+      tags: [Appeals]
+      summary: 游客申诉
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pass_id, description]
+              properties:
+                pass_id: { type: string }
+                verification_id: { type: string }
+                type: { type: string, example: WRONG_DEDUCTION }
+                description: { type: string }
+      responses:
+        "200": { description: OK }
+    get:
+      tags: [Appeals]
+      summary: 申诉列表
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [PENDING, APPROVED, REJECTED] } }
+      responses:
+        "200": { description: OK }
+
+  /api/appeals/{id}/resolve:
+    post:
+      tags: [Appeals]
+      summary: 客服处理申诉（通过自动返还误扣额度）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [approve, resolution, handler]
+              properties:
+                approve: { type: boolean }
+                resolution: { type: string }
+                compensate_quota: { type: integer }
+                handler: { type: string }
+      responses:
+        "200": { description: OK }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/attractions:
+    get:
+      tags: [Base]
+      summary: 景点列表
+      responses:
+        "200": { description: OK }
+    post:
+      tags: [Base]
+      summary: 创建景点
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                id: { type: string }
+                name: { type: string }
+                capacity: { type: integer }
+      responses:
+        "200": { description: OK }
+
+  /api/attractions/{id}/capacity:
+    get:
+      tags: [Base]
+      summary: 景点当前在园人数
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: date, in: query, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+
+  /api/holidays:
+    get:
+      tags: [Base]
+      summary: 节假日配置
+      responses:
+        "200": { description: OK }
+    put:
+      tags: [Base]
+      summary: 设置节假日
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                dates:
+                  type: array
+                  items: { type: string, example: "2026-10-01" }
+                operator: { type: string }
+      responses:
+        "200": { description: OK }
+
+  /api/admin/sales-rules:
+    get:
+      tags: [Admin]
+      summary: 售卖规则
+      responses:
+        "200": { description: OK }
+
+  /api/admin/sales-rules/{type}:
+    put:
+      tags: [Admin]
+      summary: 调整售卖规则（仅影响新售卡）
+      parameters:
+        - { name: type, in: path, required: true, schema: { type: string, enum: [single, family, parent_child] } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                price: { type: number }
+                total_quota: { type: integer }
+                companion_limit: { type: integer }
+                on_sale: { type: boolean }
+                daily_limit: { type: integer }
+      responses:
+        "200": { description: OK }
+
+  /api/admin/stats/overview:
+    get:
+      tags: [Admin]
+      summary: 运营总览
+      parameters:
+        - { name: date, in: query, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+
+  /api/admin/stats/peaks:
+    get:
+      tags: [Admin]
+      summary: 入园峰值
+      parameters:
+        - { name: date, in: query, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+
+  /api/admin/gate-logs:
+    get:
+      tags: [Admin]
+      summary: 闸机流水
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, default: 100 } }
+      responses:
+        "200": { description: OK }
+
+  /api/admin/devices/offline-ranking:
+    get:
+      tags: [Admin, Offline]
+      summary: 闸机离线排行（维护计划 / 高峰入口调度参考）
+      description: |
+        按风险分降序返回全部闸机的离线次数、累计离线时长、离线放行条数、
+        已合并批次数、回补额度、待复核数、异常放行数与最近离线时段。
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/DeviceOfflineStat" }
+
+components:
+  securitySchemes:
+    OperatorHeader:
+      type: apiKey
+      in: header
+      name: X-Operator
+      description: 演示环境操作人标识（如 staff-chen / cs-wang / ops-li），也可在 body.operator 传入
+  responses:
+    NotFound:
+      description: 资源不存在
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    BadRequest:
+      description: 请求参数错误
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Conflict:
+      description: 冲突（重复处理/状态不允许/额度不足等）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            message: { type: string }
+    DataEnvelope:
+      type: object
+      properties:
+        data: { type: object }
+    VerifyRequest:
+      type: object
+      required: [request_id, device_id, attraction]
+      properties:
+        request_id: { type: string, description: 闸机幂等键，重试必须不变 }
+        device_id: { type: string }
+        pass_id: { type: string }
+        qr_token: { type: string }
+        id_card: { type: string }
+        face_score: { type: number, example: 88.5 }
+        photo_clear: { type: boolean }
+        companions:
+          type: array
+          items: { type: string }
+        attraction: { type: string }
+        timestamp: { type: string, format: date-time }
+        offline_sync: { type: boolean, description: true 表示闸机离线补传 }
+    VerifyResult:
+      type: object
+      properties:
+        verification_id: { type: string }
+        decision: { type: string, enum: [ALLOW, MANUAL_REVIEW, QUOTA_INSUFFICIENT, SUSPECTED_LENDING] }
+        reason: { type: string }
+        detail: { type: string }
+        charged_quota: { type: integer }
+        remaining_quota: { type: integer }
+        duplicate_of: { type: string }
+    OfflineBatchInput:
+      type: object
+      required: [device_id, events]
+      properties:
+        device_id: { type: string, example: dev-offline-02 }
+        offline_from: { type: string, format: date-time }
+        offline_to: { type: string, format: date-time }
+        operator: { type: string }
+        events:
+          type: array
+          items: { $ref: "#/components/schemas/OfflineEventInput" }
+    OfflineEventInput:
+      type: object
+      required: [request_id, local_time]
+      properties:
+        request_id: { type: string, description: 闸机本地幂等键 }
+        event_id: { type: string }
+        pass_id: { type: string, description: 闸机本地缓存识别出的年卡 }
+        principal_id_card: { type: string, description: 主入园人证件号 }
+        principal_name: { type: string }
+        companions:
+          type: array
+          description: 全部同行人证件（含未绑定者）
+          items: { type: string }
+        companion_names:
+          type: object
+          additionalProperties: { type: string }
+        face_score: { type: number }
+        local_time: { type: string, format: date-time, description: 闸机本地放行时间 }
+    OfflineGroup:
+      type: object
+      properties:
+        key: { type: string }
+        pass_id: { type: string }
+        principal_id: { type: string }
+        principal_name: { type: string }
+        attraction: { type: string }
+        event_ids:
+          type: array
+          items: { type: string }
+        times:
+          type: array
+          items: { type: string }
+        head_count: { type: integer, description: 实际应扣人次（主+去重后的同行人） }
+        charged_total: { type: integer, description: 闸机本地扣次总额 }
+        refund_quota: { type: integer, description: 判定重复后回补额度 }
+        status: { type: string, enum: [MERGED_NO_DUP, REFUNDED, UNRESOLVED, NO_PASS] }
+        unbound_id_cards:
+          type: array
+          items: { type: string }
+    OfflineBatch:
+      type: object
+      properties:
+        id: { type: string }
+        device_id: { type: string }
+        gate_id: { type: string }
+        attraction: { type: string }
+        offline_from: { type: string, format: date-time }
+        offline_to: { type: string, format: date-time }
+        status: { type: string, enum: [PROCESSED, PARTIAL] }
+        event_count: { type: integer }
+        allowed_count: { type: integer }
+        groups:
+          type: array
+          items: { $ref: "#/components/schemas/OfflineGroup" }
+        refund_total: { type: integer }
+        review_ids:
+          type: array
+          items: { type: string }
+        operator: { type: string }
+        created_at: { type: string, format: date-time }
+    OfflineReview:
+      type: object
+      properties:
+        id: { type: string }
+        batch_id: { type: string }
+        event_id: { type: string }
+        device_id: { type: string }
+        gate_id: { type: string }
+        attraction: { type: string }
+        pass_id: { type: string }
+        holder_name: { type: string }
+        principal_id: { type: string }
+        principal_name: { type: string }
+        unbound_id_card: { type: string }
+        unbound_name: { type: string }
+        entered_at: { type: string, format: date-time }
+        status: { type: string, enum: [PENDING, REGISTERED, CHARGED, ANOMALY] }
+        action: { type: string, enum: [REGISTER, CHARGE, ANOMALY] }
+        charged_quota: { type: integer }
+        operator: { type: string }
+        note: { type: string }
+        created_at: { type: string, format: date-time }
+        resolved_at: { type: string, format: date-time }
+    Notification:
+      type: object
+      properties:
+        id: { type: string }
+        pass_id: { type: string }
+        phone: { type: string }
+        channel: { type: string, enum: [SMS, INBOX] }
+        type: { type: string, enum: [OFFLINE_REFUND, REVIEW_PENDING, REVIEW_RESOLVED] }
+        title: { type: string }
+        content: { type: string }
+        created_at: { type: string, format: date-time }
+    DeviceOfflineStat:
+      type: object
+      properties:
+        device_id: { type: string }
+        name: { type: string }
+        gate_id: { type: string }
+        attraction: { type: string }
+        online: { type: boolean }
+        offline_episodes: { type: integer }
+        offline_seconds: { type: integer }
+        last_offline_from: { type: string, format: date-time }
+        last_offline_to: { type: string, format: date-time }
+        offline_entries: { type: integer }
+        merged_batches: { type: integer }
+        refunded_quota: { type: integer }
+        pending_reviews: { type: integer }
+        anomaly_releases: { type: integer }
+        risk_score: { type: number }
+
+security:
+  - OperatorHeader: []

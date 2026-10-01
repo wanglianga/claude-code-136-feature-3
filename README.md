@@ -1,8 +1,9 @@
-# passgate — 景区年卡实名入园同行权益与异常核验服务
+# passgate — 景区年卡实名入园同行权益、异常核验与离线权益回补服务
 
 基于 **Go + Fiber + Redis** 的景区年卡核验后端。覆盖：家庭/单人/亲子年卡售卖与实名信息管理、
 闸机入园核验（人脸/证件/二维码/同行人/时段/容量）、异常核验原因可追溯、冻结/退款/升级权益重算、
-现场人工放行留痕、客服申诉与权益返还、运营售卖规则与统计分析。
+现场人工放行留痕、客服申诉与权益返还、运营售卖规则与统计分析、
+**闸机离线本地放行后的日志合并、重复扣次自动回补与通知、未绑定同行人现场复核、闸机离线质量排行**。
 
 ## 快速启动
 
@@ -20,20 +21,32 @@ go build -o passgate . && ./passgate
 # 环境变量：PORT（默认 8080）、REDIS_ADDR（默认 127.0.0.1:6379）
 ```
 
+```bash
+# 方式二：Docker Compose 一键启动（app + Redis + Swagger UI）
+docker compose up --build
+# 服务:       http://localhost:8080
+# Swagger UI: http://localhost:8081/docs/   （OpenAPI 文档：openapi.yaml）
+```
+
 启动后可见种子日志：示例年卡 家庭卡=P000001 单人卡=P000002 亲子卡=P000003。
 
 ## 本地验证方式
 
 ```bash
-bash test/run.sh        # 一键：构建 → 重置 Redis → 重启服务 → 运行全部 78 项端到端断言
+bash test/run.sh        # 一键：构建 → 重置 Redis → 重启服务 → 运行全部 112 项端到端断言
 # 或服务已启动且为全新种子库时：
 python3 test/e2e.py
 ```
 
-验证结论（实际执行）：`bash test/run.sh` 全量通过，输出 `RESULT: PASS=78 FAIL=0`，覆盖
+> 说明：端到端场景固定在营业日 **2026-10-09**（国庆假期 10-01~08 之后，单人卡节假日不可用），
+> 因此用例结果不受实际运行日期影响。
+
+验证结论（实际执行）：`bash test/run.sh` 全量通过，输出 `RESULT: PASS=112 FAIL=0`，覆盖
 正常放行、幂等重试、抖动去重、20 并发同/不同 request_id 均只扣 1 次、16 类失败原因、
 人工放行留痕、冻结/解冻与预约一致性、申诉返还、退款/升级重算、信息变更、免刷脸人工确认、
-出园释放容量、运营统计与日志查询。
+出园释放容量、运营统计与日志查询，以及本期新增的
+**离线日志合并、重复刷闸识别与权益自动回补+短信通知、未绑定同行人三种复核处置、
+无法对账记录 PARTIAL、批次重放幂等、闸机离线质量排行（34 项新断言）**。
 
 ## 演示数据与测试账号
 
@@ -113,6 +126,43 @@ python3 test/e2e.py
 | GET/PUT | `/api/admin/sales-rules[/:type]` | 售卖规则查询与调整（仅影响新售卡） |
 | GET | `/api/admin/stats/overview` `/stats/peaks` `/gate-logs` | 按卡类型售卖/权益使用率/异常率、入园峰值、闸机流水 |
 
+### 闸机离线权益回补（本期扩展）
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/offline/batches` | 闸机恢复后**整批上报离线日志**并触发合并：识别重复扣次→自动回补→短信通知；未绑定同行人生成复核单；累计设备离线指标 |
+| GET | `/api/offline/batches[?limit]` `/api/offline/batches/:id` | 离线合并批次列表/详情（含每个游客分组的 head_count / charged_total / refund_quota / status） |
+| GET | `/api/offline/reviews[?status=PENDING]` | 未绑定同行人入园的现场复核单 |
+| POST | `/api/offline/reviews/:id/resolve` | 现场处置：`REGISTER` 补登记（不追扣，受成员更换名额约束）/ `CHARGE` 追扣 1 人次 / `ANOMALY` 标记异常放行；处置后短信通知游客 |
+| GET | `/api/passes/:id/offline-reviews` | 年卡视角的复核单 |
+| GET | `/api/notifications[?pass_id=]` | 游客通知（回补/复核结果；短信内容同时留库 `sms:out`） |
+| GET | `/api/admin/devices/offline-ranking` | **闸机离线排行**：离线次数/累计时长/离线放行数/已合并批次/回补额度/待复核/异常放行/风险分，供维护计划与高峰入口调度参考 |
+
+`POST /api/offline/batches` 请求示例：
+
+```json
+{
+  "device_id": "dev-offline-02",
+  "offline_from": "2026-10-09T09:00:00+08:00",
+  "offline_to":   "2026-10-09T11:30:00+08:00",
+  "operator": "staff-chen",
+  "events": [
+    {
+      "request_id": "M-E1",
+      "event_id": "M-E1",
+      "principal_id_card": "110101199001011234",
+      "companions": ["110101199203054321"],
+      "companion_names": {"110101199203054321": "李四"},
+      "face_score": 92.0,
+      "local_time": "2026-10-09T10:30:00+08:00"
+    }
+  ]
+}
+```
+
+新增原因码：`OFFLINE_DUP_REFUND`（离线重复扣次已回补）、`OFFLINE_UNBOUND_PERSON`（离线期间未绑定同行人）、
+`OFFLINE_ANOMALY_RELEASE`（离线异常放行）。批次 `status`：`PROCESSED` / `PARTIAL`（含无法对账 `NO_PASS`
+或额度不足 `UNRESOLVED` 分组）；分组 `status`：`MERGED_NO_DUP` / `REFUNDED` / `UNRESOLVED` / `NO_PASS`。
+
 ## 关键设计
 
 - **幂等防重（网络抖动/闸机重试）**：`request_id` 先 `SET NX` 占位，重试直接返回首次结果；
@@ -124,8 +174,25 @@ python3 test/e2e.py
   `MANUAL_RELEASE`，客服 `GET /api/verifications/:id` 可见完整链路；同一核验仅可处理一次。
 - **权益一致性**：额度以 Redis 计数器为权威；申诉通过自动返还；退款清零；升级按新卡重置并重算有效期；
   冻结/解冻只改状态，不触碰预约与额度。
-- **离线闸机**：心跳超时判离线，正常请求转人工；离线期间闸机本地放行的记录以 `offline_sync=true`
-  补传，凭 `request_id` 幂等去重，不会重复扣次。
+- **在线离线两条核验路径**：
+  - 在线：心跳超时判离线，正常请求转人工；闸机离线期间自行放行年卡用户。
+  - 离线补传（`/api/verify` 的 `offline_sync=true`）：单条补传，凭 `request_id` 幂等，不做容量与在线去重判定。
+- **离线日志合并与权益回补**（`internal/service/offline.go`）：
+  1. 整批日志按 `request_id` 幂等（已合并跳过，整批重复返回 409）；
+  2. 按「年卡 + 景点 + 日期 + 主入园人证件」聚合为入园事件组，事件按闸机本地时间排序；
+  3. 每条离线日志按**闸机当时放行人数**（主+当次已绑定同行）审计出本地扣次，
+     组内按人去重得到**实际应扣人次**（最早入园者保留），两者之差即重复扣次；
+     每组由 **Lua 脚本原子完成「回放本地总扣次 → 回补重复部分」**（净扣=实际入园人次，
+     计数器瞬时状态不外暴），核验记录标 `OFFLINE_DUP_REFUND`、写 `OFFLINE_REFUND` 变更日志，
+     并向持卡人发短信（`sms:out` 留痕）；
+  4. 未绑定同行人**不计入扣次**，生成 `PENDING` 复核单，现场三选一处置且仅可处置一次；
+  5. 无法匹配年卡的离线放行落 `NO_PASS`、组内实际入园人次超出余额落 `UNRESOLVED`，
+     批次标记 `PARTIAL` 转人工核查，绝不静默吞掉；
+  6. 组级扣减失败时统一回滚已入账净额并释放本批幂等占位，整批可安全重试；
+     离线合并不写 90 秒在线去重标记，恢复后的在线核验不受影响。
+- **闸机离线质量度量**：每次合并累计设备维度的离线次数、离线时长、离线放行条数、回补额度、
+  待复核与异常放行数，`/api/admin/devices/offline-ranking` 按风险分降序输出，
+  为后续维护计划（优先维修高风险闸机）与高峰入口调度（薄弱入口增配人力/备用闸机）提供数据依据。
 
 ## 目录结构
 
@@ -133,9 +200,12 @@ python3 test/e2e.py
 main.go                  入口（依赖装配、种子、HTTP 服务）
 internal/model/          实体定义
 internal/store/          Redis 封装（JSON 存取、ID 序列、分布式锁）
-internal/service/        业务层：pass.go 年卡生命周期 / verify.go 核验引擎 / ops.go 设备·预约·申诉·统计
+internal/service/        业务层：pass.go 年卡生命周期 / verify.go 核验引擎 /
+                         ops.go 设备·预约·申诉·统计 / offline.go 离线合并·回补·复核·离线指标
 internal/handler/        Fiber 路由与错误映射
 internal/seed/           演示数据
-test/e2e.py              78 项端到端断言
+test/e2e.py              112 项端到端断言
 test/run.sh              一键验证（重置环境后全量跑）
+openapi.yaml             OpenAPI 3.x 接口文档（docker compose 启动后 Swagger UI 可浏览）
+Dockerfile / docker-compose.yml  一键容器化启动（app + Redis + Swagger UI）
 ```

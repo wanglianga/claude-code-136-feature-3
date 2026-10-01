@@ -337,10 +337,14 @@ func (s *Service) resultOf(ctx context.Context, v *model.Verification) *VerifyRe
 
 func (s *Service) writeGateLog(ctx context.Context, v *model.Verification, action, operator string) {
 	id, _ := s.St.NextID(ctx, "glog", "G")
+	ts := v.CreatedAt
+	if ts.IsZero() {
+		ts = time.Now()
+	}
 	gl := model.GateLog{
 		ID: id, VerificationID: v.ID, PassID: v.PassID, DeviceID: v.DeviceID, GateID: v.GateID,
 		Attraction: v.Attraction, Direction: "ENTRY", Action: action, Reason: v.Reason,
-		QuotaCharged: v.ChargedQuota, Operator: operator, CreatedAt: time.Now(),
+		QuotaCharged: v.ChargedQuota, Operator: operator, CreatedAt: ts,
 	}
 	_ = s.St.SetJSON(ctx, keyGateLog(id), &gl)
 	s.St.R.LPush(ctx, keyGateLogList(), id)
@@ -480,6 +484,7 @@ type ExitRequest struct {
 	Attraction string `json:"attraction"`
 	Count      int    `json:"count"`
 	DeviceID   string `json:"device_id"`
+	Date       string `json:"date"` // 可选 YYYY-MM-DD，闸机补传出园时上报；缺省取服务端当天
 }
 
 // Exit 出园：释放在园容量
@@ -491,6 +496,9 @@ func (s *Service) Exit(ctx context.Context, req ExitRequest) error {
 		req.Count = 1
 	}
 	date := dateOf(time.Now())
+	if validDate(req.Date) {
+		date = req.Date
+	}
 	// 容量不为负
 	script := redis.NewScript(`
 local cur = tonumber(redis.call('GET', KEYS[1]) or '0')

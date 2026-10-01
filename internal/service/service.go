@@ -81,6 +81,18 @@ func keyMultiLoc(passID string) string          { return "loc:" + passID }
 func keyManualReview(id string) string          { return "mreview:" + id }
 func keyVerifReview(verifID string) string      { return "verif:" + verifID + ":review" }
 
+// ---------- 离线合并相关 key ----------
+func keyOfflineBatch(id string) string        { return "offbatch:" + id }
+func keyOfflineBatchList() string             { return "offbatch:list" }
+func keyDeviceBatches(deviceID string) string { return "device:" + deviceID + ":batches" }
+func keyOfflineEvent(id string) string        { return "offevent:" + id }
+func keyOfflineReview(id string) string       { return "offreview:" + id }
+func keyOfflineReviewList() string            { return "offreview:list" }
+func keyPassReviews(passID string) string     { return "pass:" + passID + ":offreviews" }
+func keyNotification(id string) string        { return "notif:" + id }
+func keyPassNotifs(passID string) string      { return "pass:" + passID + ":notifs" }
+func keyNotificationList() string             { return "notif:list" }
+
 // ---------- 时间辅助 ----------
 func dateOf(t time.Time) string { return t.Format("2006-01-02") }
 

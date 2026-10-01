@@ -54,6 +54,10 @@ const (
 	ReasonMultiLocation     = "MULTI_LOCATION"
 	ReasonQuotaExhausted    = "QUOTA_EXHAUSTED"
 	ReasonDuplicateEntry    = "DUPLICATE_ENTRY" // 网络抖动重复请求，视为同一次入园
+	// 离线合并相关原因码
+	ReasonOfflineDupRefund = "OFFLINE_DUP_REFUND"      // 离线重复扣次，权益已回补
+	ReasonOfflineUnbound   = "OFFLINE_UNBOUND_PERSON"  // 离线期间未绑定同行人入园
+	ReasonOfflineAnomaly   = "OFFLINE_ANOMALY_RELEASE" // 离线异常放行（无法正常对账）
 )
 
 // Member 年卡成员（持卡人 + 同行成员）
@@ -108,24 +112,25 @@ type PassView struct {
 
 // Verification 一次闸机核验记录（无论成败均落库，客服可查）
 type Verification struct {
-	ID           string    `json:"id"`
-	RequestID    string    `json:"request_id"` // 闸机侧幂等键
-	PassID       string    `json:"pass_id"`
-	PassType     string    `json:"pass_type"`
-	HolderName   string    `json:"holder_name"`
-	DeviceID     string    `json:"device_id"`
-	GateID       string    `json:"gate_id"`
-	Attraction   string    `json:"attraction"`
-	Decision     Decision  `json:"decision"`
-	Reason       string    `json:"reason"`
-	Detail       string    `json:"detail"` // 人类可读说明，客服解释用
-	FaceScore    float64   `json:"face_score"`
-	Companions   []string  `json:"companions"`
-	ChargedQuota int       `json:"charged_quota"`
-	DuplicateOf  string    `json:"duplicate_of,omitempty"`
-	OfflineSync  bool      `json:"offline_sync"`
-	ManualAction string    `json:"manual_action,omitempty"` // RELEASED | REJECTED
-	CreatedAt    time.Time `json:"created_at"`
+	ID            string    `json:"id"`
+	RequestID     string    `json:"request_id"` // 闸机侧幂等键
+	PassID        string    `json:"pass_id"`
+	PassType      string    `json:"pass_type"`
+	HolderName    string    `json:"holder_name"`
+	DeviceID      string    `json:"device_id"`
+	GateID        string    `json:"gate_id"`
+	Attraction    string    `json:"attraction"`
+	Decision      Decision  `json:"decision"`
+	Reason        string    `json:"reason"`
+	Detail        string    `json:"detail"` // 人类可读说明，客服解释用
+	FaceScore     float64   `json:"face_score"`
+	Companions    []string  `json:"companions"`
+	ChargedQuota  int       `json:"charged_quota"`
+	DuplicateOf   string    `json:"duplicate_of,omitempty"`
+	OfflineSync   bool      `json:"offline_sync"`
+	ManualAction  string    `json:"manual_action,omitempty"`  // RELEASED | REJECTED
+	RefundedQuota int       `json:"refunded_quota,omitempty"` // 离线合并判定重复扣次后回补的额度
+	CreatedAt     time.Time `json:"created_at"`
 }
 
 // ManualReview 现场人工处理记录（人工放行必须留痕，客服可解释）
@@ -224,4 +229,116 @@ type ChangeLog struct {
 	Detail    string    `json:"detail"`
 	Operator  string    `json:"operator"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+// OfflineEvent 闸机离线期间本地放行的一条原始记录（恢复后随批次上报合并）
+type OfflineEvent struct {
+	EventID       string    `json:"event_id"` // 闸机本地生成的唯一 ID（与 request_id 同义）
+	RequestID     string    `json:"request_id"`
+	DeviceID      string    `json:"device_id"`
+	GateID        string    `json:"gate_id"`
+	Attraction    string    `json:"attraction"`
+	PrincipalID   string    `json:"principal_id"` // 主入园人证件号（离线放行时登记）
+	PrincipalName string    `json:"principal_name"`
+	PassID        string    `json:"pass_id"`    // 闸机能本地识别时填写（二维码缓存）
+	Companions    []string  `json:"companions"` // 同行人证件号（含未绑定者）
+	FaceScore     float64   `json:"face_score"`
+	LocalTime     time.Time `json:"local_time"` // 闸机本地放行时间
+	SyncedAt      time.Time `json:"synced_at"`
+}
+
+// OfflineGroup 合并时按「同一游客 + 同一景点 + 同一离线时段」聚合出的入园事件组
+type OfflineGroup struct {
+	Key           string   `json:"key"`
+	PassID        string   `json:"pass_id"`
+	PrincipalID   string   `json:"principal_id"`
+	PrincipalName string   `json:"principal_name"`
+	Attraction    string   `json:"attraction"`
+	EventIDs      []string `json:"event_ids"`
+	Times         []string `json:"times"`
+	HeadCount     int      `json:"head_count"`       // 该组实际应扣人次（主+已绑定同行）
+	ChargedTotal  int      `json:"charged_total"`    // 补传链路已扣总额
+	RefundQuota   int      `json:"refund_quota"`     // 判定重复后回补额度
+	Status        string   `json:"status"`           // MERGED_NO_DUP | REFUNDED | UNRESOLVED | NO_PASS
+	UnboundIDCard []string `json:"unbound_id_cards"` // 组内出现的未绑定同行人证件
+}
+
+// OfflineBatch 一次离线日志合并批次（一台闸机恢复后上报一批）
+type OfflineBatch struct {
+	ID           string         `json:"id"`
+	DeviceID     string         `json:"device_id"`
+	GateID       string         `json:"gate_id"`
+	Attraction   string         `json:"attraction"`
+	OfflineFrom  time.Time      `json:"offline_from"`
+	OfflineTo    time.Time      `json:"offline_to"`
+	Status       string         `json:"status"` // PROCESSED | PARTIAL
+	EventCount   int            `json:"event_count"`
+	AllowedCount int            `json:"allowed_count"`
+	Groups       []OfflineGroup `json:"groups"`
+	RefundTotal  int            `json:"refund_total"`
+	ReviewIDs    []string       `json:"review_ids"`
+	Operator     string         `json:"operator"`
+	CreatedAt    time.Time      `json:"created_at"`
+}
+
+// 复核单处置动作
+const (
+	ReviewActionRegister = "REGISTER" // 补登记：事后绑定同行人（若有更换名额），本次不追扣
+	ReviewActionCharge   = "CHARGE"   // 扣权益：承认入园事实，按 1 人次追扣
+	ReviewActionAnomaly  = "ANOMALY"  // 标记异常放行：不扣不登记，留痕待查
+)
+
+// OfflineReview 离线期间未绑定同行人入园的现场复核单
+type OfflineReview struct {
+	ID            string     `json:"id"`
+	BatchID       string     `json:"batch_id"`
+	EventID       string     `json:"event_id"`
+	DeviceID      string     `json:"device_id"`
+	GateID        string     `json:"gate_id"`
+	Attraction    string     `json:"attraction"`
+	PassID        string     `json:"pass_id"`
+	HolderName    string     `json:"holder_name"`
+	PrincipalID   string     `json:"principal_id"`
+	PrincipalName string     `json:"principal_name"`
+	UnboundIDCard string     `json:"unbound_id_card"`
+	UnboundName   string     `json:"unbound_name"`
+	EnteredAt     time.Time  `json:"entered_at"`
+	Status        string     `json:"status"` // PENDING | REGISTERED | CHARGED | ANOMALY
+	Action        string     `json:"action,omitempty"`
+	ChargedQuota  int        `json:"charged_quota,omitempty"`
+	Operator      string     `json:"operator,omitempty"`
+	Note          string     `json:"note,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	ResolvedAt    *time.Time `json:"resolved_at,omitempty"`
+}
+
+// VisitorNotification 游客通知（短信/站内信，演示环境落库可查）
+type VisitorNotification struct {
+	ID        string    `json:"id"`
+	PassID    string    `json:"pass_id"`
+	Phone     string    `json:"phone"`
+	Channel   string    `json:"channel"` // SMS | INBOX
+	Type      string    `json:"type"`    // OFFLINE_REFUND | REVIEW_PENDING | REVIEW_RESOLVED
+	Title     string    `json:"title"`
+	Content   string    `json:"content"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// DeviceOfflineStat 闸机离线指标（维护计划与高峰调度参考）
+type DeviceOfflineStat struct {
+	DeviceID        string  `json:"device_id"`
+	Name            string  `json:"name"`
+	GateID          string  `json:"gate_id"`
+	Attraction      string  `json:"attraction"`
+	Online          bool    `json:"online"`
+	OfflineEpisodes int64   `json:"offline_episodes"` // 离线时段次数
+	OfflineSeconds  int64   `json:"offline_seconds"`  // 累计离线时长
+	LastOfflineFrom string  `json:"last_offline_from"`
+	LastOfflineTo   string  `json:"last_offline_to"`
+	OfflineEntries  int64   `json:"offline_entries"` // 离线期间本地放行条数
+	MergedBatches   int64   `json:"merged_batches"`
+	RefundedQuota   int64   `json:"refunded_quota"`
+	PendingReviews  int64   `json:"pending_reviews"`
+	AnomalyReleases int64   `json:"anomaly_releases"`
+	RiskScore       float64 `json:"risk_score"` // 综合风险分，越高越该优先维护
 }

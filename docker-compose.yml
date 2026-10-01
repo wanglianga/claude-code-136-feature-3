@@ -1,0 +1,45 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: passgate-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  app:
+    build: .
+    container_name: passgate-app
+    environment:
+      PORT: "8080"
+      REDIS_ADDR: "redis:6379"
+      TZ: "Asia/Shanghai"
+    ports:
+      - "8080:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # 可运行的 Swagger UI（OpenAPI 3.x 文档见 openapi.yaml）
+  swagger-ui:
+    image: swaggerapi/swagger-ui:v5.17.14
+    container_name: passgate-swagger-ui
+    environment:
+      SWAGGER_JSON: /openapi.yaml
+      BASE_URL: /docs/
+    volumes:
+      - ./openapi.yaml:/usr/share/nginx/html/openapi.yaml:ro
+    ports:
+      - "8081:8080"
+    depends_on:
+      - app
+    restart: unless-stopped
+
+volumes:
+  redis-data:

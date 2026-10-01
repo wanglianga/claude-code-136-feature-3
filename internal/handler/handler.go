@@ -166,6 +166,19 @@ func Register(app *fiber.App, svc *service.Service) {
 		list, err := svc.ListGateLogs(ctx(), c.Params("id"), 200)
 		return respond(c, list, err)
 	})
+	api.Get("/passes/:id/offline-reviews", func(c *fiber.Ctx) error {
+		list, err := svc.ListOfflineReviews(ctx(), c.Query("status"))
+		if err != nil {
+			return respond(c, nil, err)
+		}
+		out := make([]model.OfflineReview, 0, len(list))
+		for _, rv := range list {
+			if rv.PassID == c.Params("id") {
+				out = append(out, rv)
+			}
+		}
+		return respond(c, out, nil)
+	})
 
 	// ---- 核验 ----
 	api.Post("/verify", func(c *fiber.Ctx) error {
@@ -216,6 +229,46 @@ func Register(app *fiber.App, svc *service.Service) {
 	})
 	api.Get("/devices", func(c *fiber.Ctx) error {
 		list, err := svc.ListDevices(ctx())
+		return respond(c, list, err)
+	})
+
+	// ---- 闸机离线：日志合并 / 权益回补 / 现场复核 / 通知 ----
+	api.Post("/offline/batches", func(c *fiber.Ctx) error {
+		var in service.OfflineBatchInput
+		if err := c.BodyParser(&in); err != nil {
+			return fail(ErrBadRequest)
+		}
+		if in.Operator == "" {
+			in.Operator = operator(c, "")
+		}
+		b, err := svc.MergeOfflineLogs(ctx(), in)
+		return respond(c, b, err)
+	})
+	api.Get("/offline/batches", func(c *fiber.Ctx) error {
+		list, err := svc.ListOfflineBatches(ctx(), c.QueryInt("limit", 50))
+		return respond(c, list, err)
+	})
+	api.Get("/offline/batches/:id", func(c *fiber.Ctx) error {
+		b, err := svc.GetOfflineBatch(ctx(), c.Params("id"))
+		return respond(c, b, err)
+	})
+	api.Get("/offline/reviews", func(c *fiber.Ctx) error {
+		list, err := svc.ListOfflineReviews(ctx(), c.Query("status"))
+		return respond(c, list, err)
+	})
+	api.Post("/offline/reviews/:id/resolve", func(c *fiber.Ctx) error {
+		var in service.OfflineReviewInput
+		if err := c.BodyParser(&in); err != nil {
+			return fail(ErrBadRequest)
+		}
+		if in.Operator == "" {
+			in.Operator = operator(c, "")
+		}
+		rv, err := svc.ResolveOfflineReview(ctx(), c.Params("id"), in)
+		return respond(c, rv, err)
+	})
+	api.Get("/notifications", func(c *fiber.Ctx) error {
+		list, err := svc.ListNotifications(ctx(), c.Query("pass_id"), c.QueryInt("limit", 50))
 		return respond(c, list, err)
 	})
 
@@ -329,6 +382,10 @@ func Register(app *fiber.App, svc *service.Service) {
 	})
 	admin.Get("/gate-logs", func(c *fiber.Ctx) error {
 		list, err := svc.ListGateLogs(ctx(), "", c.QueryInt("limit", 100))
+		return respond(c, list, err)
+	})
+	admin.Get("/devices/offline-ranking", func(c *fiber.Ctx) error {
+		list, err := svc.DeviceOfflineRanking(ctx())
 		return respond(c, list, err)
 	})
 }
